@@ -1,0 +1,12 @@
+{
+  "name": "cognito-pre-token-role-injector",
+  "version": "1.0.0",
+  "description": "AWS Lambda Pre Token Generation trigger to inject roles from Spring Boot API",
+  "main": "index.mjs",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC"
+}
