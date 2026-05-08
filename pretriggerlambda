@@ -1,0 +1,93 @@
+const mysql = require("mysql2/promise");
+
+const tenantSchemaMap = {
+    client1: "client1",
+    client2: "client2",
+    client3: "client3"
+};
+
+exports.handler = async (event) => {
+    const { tenantName, cognitoUserId } = event;
+
+    if (!tenantSchemaMap[tenantName]) {
+        throw new Error("Invalid tenant");
+    }
+
+    const schema = tenantSchemaMap[tenantName];
+
+    const connection = await mysql.createConnection({
+        host: process.env.DB_HOST,
+        user: process.env.DB_USER,
+        password: process.env.DB_PASSWORD
+    });
+
+    try {
+        const sql = `
+        SELECT DISTINCT
+            CU.Client_User_Id,
+            CR.Role_Name,
+            UP.Permission_Name
+        FROM ${schema}.Client_User CU
+        LEFT JOIN ${schema}.Client_User_Client_Role CUCR
+            ON CU.Client_User_Id = CUCR.Client_User_Id
+        LEFT JOIN ${schema}.Client_Role CR
+            ON CUCR.Client_Role_Id = CR.Client_Role_Id
+        LEFT JOIN ${schema}.Client_Role_User_Permission CRUP
+            ON CR.Client_Role_Id = CRUP.Client_Role_Id
+        LEFT JOIN Shared.User_Permission UP
+            ON CRUP.User_Permission_Id = UP.User_Permission_Id
+        WHERE CU.Cognito_User_Id = ?
+          AND CU.Is_Active = 1
+
+        UNION
+
+        SELECT DISTINCT
+            CU.Client_User_Id,
+            SR.Role_Name,
+            UP.Permission_Name
+        FROM ${schema}.Client_User CU
+        JOIN ${schema}.Client_User_Shared_Role CUSR
+            ON CU.Client_User_Id = CUSR.Client_User_Id
+        JOIN Shared.Shared_Role SR
+            ON CUSR.Shared_Role_Id = SR.Shared_Role_Id
+        JOIN Shared.Shared_Role_User_Permission SRUP
+            ON SR.Shared_Role_Id = SRUP.Shared_Role_Id
+        JOIN Shared.User_Permission UP
+            ON SRUP.User_Permission_Id = UP.User_Permission_Id
+        WHERE CU.Cognito_User_Id = ?
+          AND CU.Is_Active = 1
+        `;
+
+        const [rows] = await connection.execute(sql, [
+            cognitoUserId,
+            cognitoUserId
+        ]);
+
+        if (!rows.length) {
+            return {
+                clientUserId: null,
+                roles: [],
+                permissions: []
+            };
+        }
+
+        const clientUserId = rows[0].Client_User_Id;
+
+        const roles = [...new Set(
+            rows.map(r => r.Role_Name).filter(Boolean)
+        )];
+
+        const permissions = [...new Set(
+            rows.map(r => r.Permission_Name).filter(Boolean)
+        )];
+
+        return {
+            clientUserId,
+            roles,
+            permissions
+        };
+
+    } finally {
+        await connection.end();
+    }
+};
