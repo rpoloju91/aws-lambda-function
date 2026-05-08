@@ -1,0 +1,177 @@
+const mysql = require("mysql2/promise");
+const AWS = require("aws-sdk");
+
+/**
+ * Tenant → Schema Mapping
+ */
+const tenantSchemaMap = {
+    client1: "client1",
+    client2: "client2",
+    client3: "client3"
+};
+
+/**
+ * Aurora IAM Token Signer
+ */
+const signer = new AWS.RDS.Signer({
+    region: process.env.AWS_REGION,
+    hostname: process.env.DB_HOST,
+    port: 3306,
+    username: process.env.DB_USER
+});
+
+exports.handler = async (event) => {
+    console.log("Incoming Event:", JSON.stringify(event));
+
+    const { tenantName, cognitoUserId } = event;
+
+    /**
+     * Validate Inputs
+     */
+    if (!tenantName || !cognitoUserId) {
+        throw new Error("Missing tenantName or cognitoUserId");
+    }
+
+    /**
+     * Validate Tenant
+     */
+    if (!tenantSchemaMap[tenantName]) {
+        throw new Error(`Invalid tenant: ${tenantName}`);
+    }
+
+    const schema = tenantSchemaMap[tenantName];
+
+    /**
+     * Generate Aurora IAM Auth Token (Passwordless)
+     */
+    const authToken = signer.getAuthToken({
+        username: process.env.DB_USER
+    });
+
+    let connection;
+
+    try {
+        /**
+         * Create Aurora MySQL Connection
+         */
+        connection = await mysql.createConnection({
+            host: process.env.DB_HOST,
+            user: process.env.DB_USER,
+            password: authToken,
+            database: schema,
+            ssl: "Amazon RDS",
+            port: 3306,
+            authPlugins: {
+                mysql_clear_password: () => () =>
+                    Buffer.from(authToken + "\0")
+            }
+        });
+
+        /**
+         * Dynamic Multi-Tenant SQL
+         */
+        const sql = `
+            SELECT DISTINCT
+                CU.Client_User_Id,
+                CR.Role_Name,
+                UP.Permission_Name
+            FROM ${schema}.Client_User CU
+            LEFT JOIN ${schema}.Client_User_Client_Role CUCR
+                ON CU.Client_User_Id = CUCR.Client_User_Id
+            LEFT JOIN ${schema}.Client_Role CR
+                ON CUCR.Client_Role_Id = CR.Client_Role_Id
+            LEFT JOIN ${schema}.Client_Role_User_Permission CRUP
+                ON CR.Client_Role_Id = CRUP.Client_Role_Id
+            LEFT JOIN Shared.User_Permission UP
+                ON CRUP.User_Permission_Id = UP.User_Permission_Id
+            WHERE CU.Cognito_User_Id = ?
+              AND CU.Is_Active = 1
+
+            UNION
+
+            SELECT DISTINCT
+                CU.Client_User_Id,
+                SR.Role_Name,
+                UP.Permission_Name
+            FROM ${schema}.Client_User CU
+            JOIN ${schema}.Client_User_Shared_Role CUSR
+                ON CU.Client_User_Id = CUSR.Client_User_Id
+            JOIN Shared.Shared_Role SR
+                ON CUSR.Shared_Role_Id = SR.Shared_Role_Id
+            JOIN Shared.Shared_Role_User_Permission SRUP
+                ON SR.Shared_Role_Id = SRUP.Shared_Role_Id
+            JOIN Shared.User_Permission UP
+                ON SRUP.User_Permission_Id = UP.User_Permission_Id
+            WHERE CU.Cognito_User_Id = ?
+              AND CU.Is_Active = 1
+        `;
+
+        /**
+         * Execute Query
+         */
+        const [rows] = await connection.execute(sql, [
+            cognitoUserId,
+            cognitoUserId
+        ]);
+
+        console.log("DB Rows:", JSON.stringify(rows));
+
+        /**
+         * No Roles Found
+         */
+        if (!rows.length) {
+            return {
+                tenantName,
+                clientUserId: null,
+                roles: [],
+                permissions: []
+            };
+        }
+
+        /**
+         * Extract Unique Roles + Permissions
+         */
+        const clientUserId = rows[0].Client_User_Id;
+
+        const roles = [
+            ...new Set(
+                rows
+                    .map(row => row.Role_Name)
+                    .filter(Boolean)
+            )
+        ];
+
+        const permissions = [
+            ...new Set(
+                rows
+                    .map(row => row.Permission_Name)
+                    .filter(Boolean)
+            )
+        ];
+
+        /**
+         * Final Response for Pre-Token Lambda
+         */
+        return {
+            tenantName,
+            clientUserId,
+            roles,
+            permissions
+        };
+
+    } catch (error) {
+        console.error("Lambda DB Error:", error);
+
+        throw new Error(
+            `Role fetch failed for tenant=${tenantName}, cognitoUserId=${cognitoUserId}: ${error.message}`
+        );
+
+    } finally {
+        /**
+         * Always Close Connection
+         */
+        if (connection) {
+            await connection.end();
+        }
+    }
+};
